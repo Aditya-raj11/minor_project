@@ -1,0 +1,19 @@
+# Ignore Python cache and environment files
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Ignore sensitive database and face models
+database/
+models/
+face_data/
+exports/
+*.npy
+*.db
+*.sqlite3
+
+# OS generated files
+.DS_Store
+Thumbs.db

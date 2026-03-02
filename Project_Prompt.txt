@@ -1,0 +1,51 @@
+# Ultimate AI Prompt: Smart Attendance System
+
+**Instructions:** Copy and paste the entire text block below into an Advanced AI Assistant (like ChatGPT, Claude, Gemini). The AI will read the exact architectural blueprints, algorithms, mathematical bounds, and database schemas required to build this exact project from scratch.
+
+---
+**[COPY ALL TEXT BELOW THIS LINE AND PASTE TO AI]**
+
+## Role and Objective
+You are an expert Machine Learning Engineer and Python Developer. Your objective is to build a complete, production-ready "Smart Attendance System". The system must use Real-Time Facial Recognition via a webcam to automatically log users into a database. It must be a Desktop Application with a fully graphical UI. 
+
+**CRITICAL REQUIREMENT:** The architecture MUST natively bypass the "Frozen GUI Frame-Drop" issues notorious in localized computer vision apps. You must decouple the webcam feed rendering from the heavy Neural Network inference calculations using independent threading.
+
+## 1. Technology Stack & Dependencies
+You must construct the application using only Python 3.10+ and the following specific libraries:
+- **`customtkinter` & `Pillow`**: For the modern dark-mode Graphical User Interface.
+- **`opencv-python` (`cv2`)**: For accessing the hardware webcam buffer and matrix image cropping.
+- **`mtcnn`**: Specifically for the 3-stage cascaded facial bounding box detection.
+- **`deepface`**: Specifically locked to the `ArcFace` model for identity feature extraction.
+- **`scipy` & `numpy`**: For calculating mathematical thresholds.
+- **`sqlite3`**: For relational persistence logging (built-in).
+- **`pandas` & `openpyxl`**: For generating Excel `.xlsx` reports from the SQL queries.
+
+## 2. Core Biometric Algorithms & Mathematical Tuning
+You must hardcode the following exact algorithmic conditions into the logic:
+1. **Face Detection Threshold:** Set `CONF_THRESHOLD = 0.97`. Do not draw MTCNN bounding boxes unless the network is 97% certain it is a face. Crop faces to $224 \times 224$ pixels.
+2. **Blur Rejection (Laplacian Variance):** During user registration, convert the frame to Grayscale and run a Laplacian 2nd-derivative mathematical variance test (`cv2.Laplacian`). Set `BLUR_THRESHOLD = 80`. If the variance drops below 80, the camera frame is motion-blurred—reject it silently. Loop continuously until the system captures exactly `120` pristine frames.
+3. **The Matrix Embedding Map:** Use DeepFace to calculate vectors utilizing the **ArcFace** Additive Angular Margin Loss architecture. It must output a $1 \times 512$ dimensional floating-point array (Embedding Vector). You must save all identities not to SQL or JSON, but to a highly optimized `.npy` binary dictionary mapping `{user_code : [512_dim_array]}` stored at `/models/embeddings.npy` to ensure massive $O(1)$ RAM loading speeds on startup.
+4. **Distance Mathematics:** To map ArcFace outputs, you must calculate **Cosine Distance** (`scipy.spatial.distance.cosine`), NOT Euclidean distance. The mathematical angular strictness must be locked to `RECOG_THRESHOLD = 0.52`. Anything $\ge 0.52$ defaults to "Unknown". 
+5. **Score Overlay:** Convert the distance to a human-readable 0-100% confidence string overlaying the bounding box using the formula: `min(99.9, max(0.0, 100.0 - (distance / 0.52) * 25.0))`.
+
+## 3. Asynchronous Threading Architecture (Anti-Freeze Protocol)
+You must build a completely decoupled `WebcamEngine` class that manages parallel threading.
+1. **The Display Thread:** Runs an infinite `cv2.read()` loop solely pushing imagery to a `Tkinter` Canvas overlaying boxes. It never performs AI calculation.
+2. **The Inference Thread:** This thread performs the heavy AI calculation. **Crucial Optimization:** Do not run Neural Networks on every detected face constraint. Before invoking `ArcFace`, the thread MUST check an internal cache of recently verified faces using an **Intersection-Over-Union (IoU)** spatial tracker. 
+    - If `IoU > 0.4` and the time elapsed is under `3.0` seconds, the system bypasses the neural network, assumes it is the exact same person standing still, and inherits the cached `User_ID`. 
+3. **Queue Pipeline:** Upon a verified match, the thread passes the `User_ID` into a thread-safe `queue.Queue()`. The Main GUI uses a Tkinter `.after(50)` polling loop to pop IDs off the queue and inject them securely into the SQL database without race conditions.
+
+## 4. Database Schema Structure
+Generate a zero-configuration SQLite `attendance.db` tracking two tables:
+1. **`users`**: Columns `id` (PK), `user_code` (TEXT UNIQUE NOT NULL), `name` (TEXT NOT NULL).
+2. **`attendance`**: Columns `id` (PK), `user_id` (FK), `date` (YYYY-MM-DD), `time` (HH:MM:SS), `status` ('PRESENT').
+**Anti-Spam Constraint:** The `attendance` table MUST feature a native composite SQL unique constraint: `UNIQUE(user_id, date)`. Rather than complex Python time-tracking arrays, you must silently catch the `sqlite3.IntegrityError` to inherently restrict attendance logging to exactly one entry per user per day.
+
+## Action Plan
+Write the complete Python source files separated into:
+- `main.py` (Launcher UI and GUI routing)
+- `gui.py` (CustomTkinter interfaces, WebcamEngine multi-threading layer, SQLite injections, Pandas Excel exporter)
+- `register.py` (MTCNN bounding-box cropping, Laplacian Blur rejection loops, ArcFace `.npy` mapping array serialization)
+- `recognize.py` (Standalone Cosine-Distance calculation mathematical tester fallback script)
+
+Execute the creation of this environment structure strictly following these mathematical rules.
