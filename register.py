@@ -39,6 +39,8 @@ SAMPLES_REQUIRED = 80  # number of face samples to capture
 # ─────────────────────────────────────────────
 
 def init_db():
+    for d in ["face_data", "models", "database", "exports"]:
+        os.makedirs(d, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""

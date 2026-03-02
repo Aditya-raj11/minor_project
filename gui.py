@@ -19,6 +19,27 @@ from datetime import datetime
 from PIL import Image, ImageTk, ImageDraw, ImageFilter
 from collections import deque
 
+def _init_env():
+    for d in ["face_data", "models", "database", "exports"]:
+        os.makedirs(d, exist_ok=True)
+    conn = sqlite3.connect("database/attendance.db")
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_code TEXT UNIQUE NOT NULL,
+                  name TEXT NOT NULL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS attendance
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  date TEXT,
+                  time TEXT,
+                  status TEXT,
+                  UNIQUE(user_id, date))''')
+    conn.commit()
+    conn.close()
+
+_init_env()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG  (technical — not shown in UI)
 # ─────────────────────────────────────────────────────────────────────────────
