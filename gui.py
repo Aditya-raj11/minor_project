@@ -9,16 +9,34 @@ Performance: 3-thread engine from v3 fully retained.
 New: Clear Attendance button (with date picker) for testing/reset.
 """
 
+import multiprocessing as _mp, os as _os
+_CPU = _mp.cpu_count()
+_os.environ["OMP_NUM_THREADS"]        = str(_CPU)
+_os.environ["OPENBLAS_NUM_THREADS"]   = str(_CPU)
+_os.environ["MKL_NUM_THREADS"]        = str(_CPU)
+_os.environ["TF_NUM_INTRAOP_THREADS"] = str(_CPU)
+_os.environ["TF_NUM_INTEROP_THREADS"] = str(_CPU)
+
 import tkinter as tk
 import tkinter.ttk as ttk
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
 import cv2, numpy as np, sqlite3
-import threading, queue, os, shutil, time, math
+import threading, queue, os, shutil, time
+import serial, serial.tools.list_ports
 from datetime import datetime
 from PIL import Image, ImageTk, ImageDraw, ImageFilter
 from collections import deque
+import multiprocessing
 
+cv2.setNumThreads(multiprocessing.cpu_count())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPORTS FROM MODULES  (recognition logic lives in recognize.py / register.py)
+# ─────────────────────────────────────────────────────────────────────────────
+from recognize import mask_glasses_region, identify_face, build_mean_embeddings
+from register  import train_model_with_callback
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,160 +115,18 @@ FONT_NUM  = ("Georgia", 32, "bold")
 FONT_NUM2 = ("Georgia", 20, "bold")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4-LAYER FALSE POSITIVE FILTER  (unchanged from v3)
+# DETECTION + DATABASE  (logic lives in their own modules)
 # ─────────────────────────────────────────────────────────────────────────────
-def is_valid_face_shape(x,y,w,h,frame_shape):
-    fh,fw=frame_shape[:2]
-    if w<70 or h<70: return False,"too small"
-    if w>int(fh*0.85): return False,"too large"
-    aspect=w/max(h,1)
-    if aspect<0.60 or aspect>1.55: return False,"bad aspect"
-    margin=10
-    if x<margin or y<margin: return False,"edge"
-    if (x+w)>(fw-margin) or (y+h)>(fh-margin): return False,"edge"
-    return True,"ok"
-
-def has_valid_landmarks(result):
-    kp=result.get("keypoints",{})
-    needed=["left_eye","right_eye","nose","mouth_left","mouth_right"]
-    if not all(k in kp for k in needed): return False,"no landmarks"
-    le=np.array(kp["left_eye"],dtype=float); re=np.array(kp["right_eye"],dtype=float)
-    nos=np.array(kp["nose"],dtype=float)
-    ml=np.array(kp["mouth_left"],dtype=float); mr=np.array(kp["mouth_right"],dtype=float)
-    angle=abs(math.degrees(math.atan2(re[1]-le[1],re[0]-le[0])))
-    if angle>45: return False,f"tilt"
-    eye_cy=(le[1]+re[1])/2
-    if nos[1]<=eye_cy: return False,"nose↑"
-    if (ml[1]+mr[1])/2<=nos[1]: return False,"mouth↑"
-    x,y,w,h=result["box"]
-    ed=float(np.linalg.norm(re-le))
-    if ed<w*0.18 or ed>w*0.85: return False,"eye dist"
-    mw=float(np.linalg.norm(mr-ml))
-    if mw<10: return False,"mouth"
-    eto=nos[1]-eye_cy; ntm=(ml[1]+mr[1])/2-nos[1]
-    if eto<3 or ntm<3: return False,"flat"
-    r=eto/max(ntm,1)
-    if r<0.2 or r>4.5: return False,"ratio"
-    return True,"ok"
-
-def is_sharp_enough(face_bgr,threshold=BLUR_THRESHOLD):
-    gray=cv2.cvtColor(face_bgr,cv2.COLOR_BGR2GRAY)
-    score=cv2.Laplacian(gray,cv2.CV_64F).var()
-    return score>=threshold,float(score)
-
-def detect_valid_faces(frame,detector,conf_thr=CONF_THRESHOLD):
-    rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
-    try: results=detector.detect_faces(rgb)
-    except: results=[]
-    valid,rejected=[],[]
-    for r in results:
-        x,y,w,h=r["box"]; conf=r["confidence"]
-        x,y=max(0,x),max(0,y)
-        if conf<conf_thr: rejected.append((x,y,w,h)); continue
-        ok,_=is_valid_face_shape(x,y,w,h,frame.shape)
-        if not ok: rejected.append((x,y,w,h)); continue
-        ok,_=has_valid_landmarks(r)
-        if not ok: rejected.append((x,y,w,h)); continue
-        pad=int(0.12*max(w,h))
-        x1=max(0,x-pad); y1=max(0,y-pad)
-        x2=min(frame.shape[1],x+w+pad); y2=min(frame.shape[0],y+h+pad)
-        crop=frame[y1:y2,x1:x2]
-        if crop.size==0: rejected.append((x,y,w,h)); continue
-        ok,_=is_sharp_enough(crop)
-        if not ok: rejected.append((x,y,w,h)); continue
-        valid.append((r,cv2.resize(crop,(224,224)),x,y,w,h,conf))
-    return valid,rejected
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DATABASE
-# ─────────────────────────────────────────────────────────────────────────────
-def init_db():
-    for d in ["database",FACE_DATA_DIR,"models","exports"]:
-        os.makedirs(d,exist_ok=True)
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL, user_code TEXT UNIQUE NOT NULL,
-        registered_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS attendance(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL, date DATE NOT NULL,
-        time TIME NOT NULL, status TEXT DEFAULT 'PRESENT',
-        confidence REAL DEFAULT 0,
-        FOREIGN KEY(user_id) REFERENCES users(id),
-        UNIQUE(user_id,date))""")
-    conn.commit(); conn.close()
-
-def get_users():
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("SELECT id,name,user_code,registered_at FROM users ORDER BY name")
-    rows=c.fetchall(); conn.close(); return rows
-
-def get_today_attendance():
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    today=datetime.now().strftime("%Y-%m-%d")
-    c.execute("""SELECT u.name,u.user_code,a.time,a.status,a.confidence
-                 FROM attendance a JOIN users u ON a.user_id=u.id
-                 WHERE a.date=? ORDER BY a.time DESC""",(today,))
-    rows=c.fetchall(); conn.close(); return rows
-
-def get_attendance_filtered(date_from=None,date_to=None,user_code=None):
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    q="SELECT u.name,u.user_code,a.date,a.time,a.status,ROUND(a.confidence,1) FROM attendance a JOIN users u ON a.user_id=u.id WHERE 1=1"
-    p=[]
-    if date_from: q+=" AND a.date>=?"; p.append(date_from)
-    if date_to:   q+=" AND a.date<=?"; p.append(date_to)
-    if user_code: q+=" AND u.user_code=?"; p.append(user_code.upper())
-    q+=" ORDER BY a.date DESC,a.time DESC"
-    c.execute(q,p); rows=c.fetchall(); conn.close(); return rows
-
-def mark_attendance_db(user_code,confidence=0):
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("SELECT id FROM users WHERE user_code=?",(user_code,))
-    row=c.fetchone()
-    if not row: conn.close(); return False
-    try:
-        c.execute("INSERT INTO attendance(user_id,date,time,status,confidence) VALUES(?,?,?,'PRESENT',?)",
-                  (row[0],datetime.now().strftime("%Y-%m-%d"),datetime.now().strftime("%H:%M:%S"),confidence))
-        conn.commit(); conn.close(); return True
-    except sqlite3.IntegrityError:
-        conn.close(); return False
-
-def save_user_db(name,user_code):
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("INSERT INTO users(name,user_code) VALUES(?,?)",(name,user_code))
-    conn.commit(); conn.close()
-
-def delete_user_db(user_code):
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("SELECT id,name FROM users WHERE user_code=?",(user_code,))
-    row=c.fetchone()
-    if row:
-        c.execute("DELETE FROM attendance WHERE user_id=?",(row[0],))
-        c.execute("DELETE FROM users WHERE user_code=?",(user_code,))
-        conn.commit()
-    conn.close(); return row
-
-def delete_all_users_db():
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("DELETE FROM attendance")
-    c.execute("DELETE FROM users")
-    conn.commit()
-    conn.close()
-
-def user_exists(user_code):
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("SELECT id FROM users WHERE user_code=?",(user_code,))
-    row=c.fetchone(); conn.close(); return row is not None
-
-def clear_attendance_db(date=None):
-    """Clear all attendance for a specific date, or ALL if date=None."""
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    if date:
-        c.execute("DELETE FROM attendance WHERE date=?",(date,))
-    else:
-        c.execute("DELETE FROM attendance")
-    count=conn.total_changes; conn.commit(); conn.close(); return count
+from recognize import (
+    mask_glasses_region, identify_face, build_mean_embeddings,
+    detect_valid_faces, is_valid_face_shape, has_valid_landmarks, is_sharp_enough,
+)
+from register  import train_model_with_callback
+from database  import (
+    init_db, get_users, get_today_attendance, get_attendance_filtered,
+    mark_attendance_db, save_user_db, delete_user_db, delete_all_users_db,
+    user_exists, clear_attendance_db, get_all_users_dict,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ACCURACY RING  (restyled warm)
@@ -304,16 +180,10 @@ class WebcamEngine:
         self._overlay_lock=threading.Lock()
         self._overlay_boxes=[]; self._overlay_rej=[]
         self._fps_deque=deque(maxlen=30)
+        self._mean_db=None   # built once from embeddings_db, reset on model reload
+        self._conf_smooth={}  # user_code → EMA-smoothed confidence (reduces fluctuation)
 
     def start(self):
-        for idx in [0, 1, 2]:
-            self.cap=cv2.VideoCapture(idx)
-            if self.cap.isOpened(): break
-        if not self.cap or not self.cap.isOpened(): return False
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,CAM_W)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT,CAM_H)
-        self.cap.set(cv2.CAP_PROP_FPS,30)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
         self.running=True
         threading.Thread(target=self._capture_loop,daemon=True).start()
         threading.Thread(target=self._infer_loop,daemon=True).start()
@@ -325,6 +195,18 @@ class WebcamEngine:
         if self.cap: self.cap.release(); self.cap=None
 
     def _capture_loop(self):
+        for idx in [0, 1, 2]:
+            self.cap=cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if self.cap.isOpened(): break
+        if not self.cap or not self.cap.isOpened():
+            self.running=False
+            return
+            
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,CAM_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT,CAM_H)
+        self.cap.set(cv2.CAP_PROP_FPS,30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+        
         while self.running:
             ret,frame=self.cap.read()
             if not ret: time.sleep(0.01); continue
@@ -392,29 +274,43 @@ class WebcamEngine:
                 
                 if needs_inference:
                     try:
-                        tmp="face_data/_infer_face.jpg"
-                        cv2.imwrite(tmp,face_224)
-                        res=DeepFace.represent(img_path=tmp,model_name="ArcFace",
-                                               detector_backend="skip",
-                                               enforce_detection=False,align=False)
-                        if res and self.embeddings_db:
-                            qe=np.array(res[0]["embedding"])
-                            for uc,embs in self.embeddings_db.items():
-                                for emb in embs:
-                                    d=cosine(qe,emb) # type: ignore
-                                    if d<best_dist: best_dist=d; user_code=uc
-                            if best_dist>=RECOG_THRESHOLD: user_code=None
-                            else:
-                                conf_pct=min(99.9,max(0.0,100.0-(best_dist/RECOG_THRESHOLD)*25.0))
+                        # ── Glasses mask (from recognize.py) ───────────────────────
+                        face_for_emb = face_224.copy()
+                        kp = result.get('keypoints', {})
+                        if 'left_eye' in kp and 'right_eye' in kp:
+                            rx2,ry2,rw2,rh2 = result['box']
+                            rx2,ry2 = max(0,rx2), max(0,ry2)
+                            pad2 = int(0.12*max(rw2,rh2))
+                            x1c  = max(0,rx2-pad2); y1c = max(0,ry2-pad2)
+                            x2c  = min(frame.shape[1],rx2+rw2+pad2)
+                            y2c  = min(frame.shape[0],ry2+rh2+pad2)
+                            cw2  = max(1,x2c-x1c); ch2 = max(1,y2c-y1c)
+                            le2  = ((kp['left_eye'][0] -x1c)*224.0/cw2,
+                                    (kp['left_eye'][1] -y1c)*224.0/ch2)
+                            re2  = ((kp['right_eye'][0]-x1c)*224.0/cw2,
+                                    (kp['right_eye'][1]-y1c)*224.0/ch2)
+                            face_for_emb = mask_glasses_region(face_for_emb, le2, re2)
+
+                        # ── Identify (from recognize.py) ─────────────────────
+                        if self._mean_db is None:
+                            self._mean_db = build_mean_embeddings(self.embeddings_db)
+                        user_code, _dist, conf_pct = identify_face(
+                            face_for_emb, self.embeddings_db, self._mean_db
+                        )
                     except Exception as e:
-                        print(f"[DEBUG ERR] DeepFace inference error: {e}")
+                        print(f"[DEBUG ERR] Recognition error: {e}")
                     
                     if user_code:
+                        # ── EMA smoothing: 70% old + 30% new ──
+                        EMA = 0.30
+                        prev = self._conf_smooth.get(user_code, conf_pct)
+                        conf_pct = (1 - EMA) * prev + EMA * conf_pct
+                        self._conf_smooth[user_code] = conf_pct
                         new_cache.append({
                             'box': current_box, 'code': user_code, 'conf': conf_pct,
                             'time': now, 'last_infer': now
                         })
-                        try: self.result_q.put_nowait((user_code,conf_pct))
+                        try: self.result_q.put_nowait((user_code, conf_pct))
                         except queue.Full: pass
 
                 name=self.all_users.get(user_code,None) if user_code else None
@@ -616,6 +512,13 @@ class ClearAttendanceDialog(tk.Toplevel):
         self.destroy()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HARDWARE SERIAL LINK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_serial_ports():
+    return [p.device for p in serial.tools.list_ports.comports()]
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN APPLICATION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -637,6 +540,11 @@ class SmartAttendanceApp(ctk.CTk):
         self._last_display=0.0
         self._display_interval=1.0/30
         self._imgtk_att=None
+
+        self.arduino_serial = None
+        self.arduino_port = tk.StringVar(value="None")
+        
+        # Build UI layout immediately
 
         self._build_ui()
         self._refresh_users_list()
@@ -809,11 +717,14 @@ class SmartAttendanceApp(ctk.CTk):
         rows=get_today_attendance()
         self.home_log.delete(0,tk.END)
         if not rows:
-            self.home_log.insert(0,"   No attendance recorded yet today")
+            self.home_log.insert(0,"   No attendance / users yet")
             return
-        for name,code,t,status,conf in rows:
-            self.home_log.insert(tk.END,
-                f"   ✓  {name:<22}  {code:<14}  {t}   {conf:.0f}% match")
+        for name,code,in_t,out_t,status,conf in rows:
+            if status == "ABSENT":
+                self.home_log.insert(tk.END, f"   ✗  {name:<22}  {code:<14}  {'--':<8}   ABSENT")
+            else:
+                t_str = f"{in_t}-{out_t}" if out_t else str(in_t)
+                self.home_log.insert(tk.END, f"   ✓  {name:<22}  {code:<14}  {t_str:<16}   {conf:.0f}% match")
 
     # ══════════════════════════════════════════════════════════════════════════
     # REGISTER PAGE
@@ -988,7 +899,64 @@ class SmartAttendanceApp(ctk.CTk):
         vsb.pack(side="right",fill="y")
         self.log_listbox.pack(fill="both",expand=True,padx=6,pady=6)
 
+        # ── Arduino Control Card ─────────────────────────────────────────────
+        _,ard_card=card(right); ard_card.pack(fill="x", side="bottom", pady=(12, 0))
+        tk.Label(ard_card,text="Hardware Interface",font=FONT_H3,fg=C["text"],bg=C["card"]).pack(pady=(12,4))
+        tk.Frame(ard_card,bg=C["border"],height=1).pack(fill="x",padx=14)
+        
+        # COM port dropdown & refresh
+        cport_frame = tk.Frame(ard_card, bg=C["card"])
+        cport_frame.pack(fill="x", padx=14, pady=8)
+        
+        self.com_dropdown = ttk.Combobox(cport_frame, textvariable=self.arduino_port, state="readonly", width=12)
+        self.com_dropdown['values'] = get_serial_ports()
+        self.com_dropdown.pack(side="left")
+        if self.com_dropdown['values']: self.com_dropdown.current(0)
+        
+        def refresh_ports():
+            ports = get_serial_ports()
+            self.com_dropdown['values'] = ports
+            if ports and self.arduino_port.get() not in ports:
+                self.com_dropdown.current(0)
+                
+        pill_btn(cport_frame,"⟳",C["accent"],C["accent_dk"],refresh_ports,width=28,height=22).pack(side="right")
+        
+        # Connect Button & Status
+        conn_frame = tk.Frame(ard_card, bg=C["card"])
+        conn_frame.pack(fill="x", padx=14, pady=(0, 12))
+        
+        self.ard_status_lbl = tk.Label(conn_frame,text="Disconnected",font=FONT_XS,fg=C["red"],bg=C["card"])
+        self.ard_status_lbl.pack(side="right", pady=5)
+        
+        self.ard_conn_btn = pill_btn(conn_frame,"Connect",C["border2"],C["green"],self._toggle_arduino,width=90,height=26, text_color=C["text2"])
+        self.ard_conn_btn.pack(side="left")
+
         return page
+
+    def _toggle_arduino(self):
+        if self.arduino_serial is None:
+            # Try to connect
+            port = self.arduino_port.get()
+            if not port or port == "None":
+                messagebox.showerror("Port Error", "Select a valid COM port.", parent=self)
+                return
+            try:
+                self.arduino_serial = serial.Serial(port, 9600, timeout=1)
+                self.ard_status_lbl.configure(text="Connected", fg=C["green"])
+                self.ard_conn_btn.configure(bg=C["green"])
+                for child in self.ard_conn_btn.winfo_children(): child.configure(bg=C["green"], fg="white", text="Disconnect")
+                self.ard_conn_btn._orig_bg = C["green"]
+            except Exception as e:
+                messagebox.showerror("Serial Error", f"Failed to connect on {port}:\n\n{str(e)}", parent=self)
+        else:
+            # Disconnect
+            try: self.arduino_serial.close()
+            except: pass
+            self.arduino_serial = None
+            self.ard_status_lbl.configure(text="Disconnected", fg=C["red"])
+            self.ard_conn_btn.configure(bg=C["border2"])
+            for child in self.ard_conn_btn.winfo_children(): child.configure(bg=C["border2"], fg=C["text2"], text="Connect")
+            self.ard_conn_btn._orig_bg = C["border2"]
 
     # ══════════════════════════════════════════════════════════════════════════
     # RECORDS PAGE
@@ -1040,9 +1008,9 @@ class SmartAttendanceApp(ctk.CTk):
         # Table
         _,tf=card(page); tf.pack(fill="both",expand=True,padx=36,pady=14)
         self._style_tree()
-        cols=("Name","Person ID","Date","Time","Status","Match %")
+        cols=("Name","Person ID","Date","In - Out","Status","Match %")
         self.tree=ttk.Treeview(tf,columns=cols,show="headings",style="Clean.Treeview")
-        for col,w in zip(cols,[200,130,110,90,100,100]):
+        for col,w in zip(cols,[200,130,110,140,100,100]):
             self.tree.heading(col,text=col); self.tree.column(col,width=w,anchor="center")
         vsb=ttk.Scrollbar(tf,orient="vertical",command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -1118,7 +1086,7 @@ class SmartAttendanceApp(ctk.CTk):
         
         cap = None
         for idx in [0, 1, 2]:
-            cap = cv2.VideoCapture(idx)
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
             if cap.isOpened(): break
             
         if not cap or not cap.isOpened():
@@ -1166,7 +1134,24 @@ class SmartAttendanceApp(ctk.CTk):
                         cv2.line(d,(px,py),(px+dx*cl,py),(255,255,255),3)
                         cv2.line(d,(px,py),(px,py+dy*cl),(255,255,255),3)
                     if now-last_cap>INTERVAL:
-                        cv2.imwrite(os.path.join(save_dir,f"img_{total_done+round_done:04d}.jpg"),face_224)
+                        # Apply glasses mask before saving training image
+                        face_to_save = face_224.copy()
+                        kp = result.get('keypoints', {})
+                        if 'left_eye' in kp and 'right_eye' in kp:
+                            r2 = result
+                            x2,y2,w2,h2 = r2['box']
+                            x2,y2 = max(0,x2), max(0,y2)
+                            pad2  = int(0.12*max(w2,h2))
+                            x1_c  = max(0, x2-pad2); y1_c = max(0, y2-pad2)
+                            x2_c  = min(frame.shape[1], x2+w2+pad2)
+                            y2_c  = min(frame.shape[0], y2+h2+pad2)
+                            cw    = max(1, x2_c-x1_c); ch = max(1, y2_c-y1_c)
+                            le = ((kp['left_eye'][0]  - x1_c)*224.0/cw,
+                                  (kp['left_eye'][1]  - y1_c)*224.0/ch)
+                            re = ((kp['right_eye'][0] - x1_c)*224.0/cw,
+                                  (kp['right_eye'][1] - y1_c)*224.0/ch)
+                            face_to_save = mask_glasses_region(face_to_save, le, re)
+                        cv2.imwrite(os.path.join(save_dir,f"img_{total_done+round_done:04d}.jpg"), face_to_save)
                         round_done+=1; last_cap=now
                 total_vis=total_done+round_done
                 bw=int((total_vis/SAMPLES_NEEDED)*(d.shape[1]-40))
@@ -1209,37 +1194,19 @@ class SmartAttendanceApp(ctk.CTk):
         self.cap_status_lbl.configure(text=status,fg=C["text3"])
 
     def _train_arcface(self,name,code):
-        try:
-            from deepface import DeepFace
-        except ImportError:
-            self.after(0,lambda:messagebox.showerror("Missing Package","pip install deepface"))
-            self.after(0,self._reset_reg_ui); return
+        """Delegates to train_model_with_callback() in register.py."""
+        self.after(0,lambda:self.train_status_lbl.configure(
+            text="Building recognition model…",fg=C["text3"]))
+        state = [0.0, 0.0, 0, 0]   # pct, acc, success, fail
 
-        users=[d for d in os.listdir(FACE_DATA_DIR) if os.path.isdir(os.path.join(FACE_DATA_DIR,d))]
-        total_imgs=sum(len([f for f in os.listdir(os.path.join(FACE_DATA_DIR,u)) if f.endswith(".jpg")]) for u in users)
-        embeddings_db={}; processed=success=fail=0
-        self.after(0,lambda:self.train_status_lbl.configure(text="Building recognition model…",fg=C["text3"]))
+        def cb(pct, acc, s, f):
+            state[:] = [pct, acc, s, f]
+            self.after(0, lambda p=pct,a=acc,ss=s,ff=f:
+                       self._update_train_ui(p, a, ss, ff))
 
-        for user_code in users:
-            user_dir=os.path.join(FACE_DATA_DIR,user_code)
-            images=[f for f in os.listdir(user_dir) if f.endswith(".jpg")]
-            embs=[]
-            for img_file in images:
-                try:
-                    res=DeepFace.represent(img_path=os.path.join(user_dir,img_file),
-                                           model_name="ArcFace",detector_backend="mtcnn",
-                                           enforce_detection=True,align=True)
-                    if res: embs.append(np.array(res[0]["embedding"])); success+=1
-                except: fail+=1
-                processed+=1
-                pct=processed/max(1,total_imgs)
-                acc=(success/max(1,success+fail))*100
-                self.after(0,lambda p=pct,a=acc,s=success,f=fail:self._update_train_ui(p,a,s,f))
-            if embs: embeddings_db[user_code]=embs
-
-        np.save(MODEL_PATH,embeddings_db)
-        final_acc=(success/max(1,success+fail))*100
-        self.after(0,lambda a=final_acc,s=success,f=fail:self._finish_training(a,s,f,name))
+        train_model_with_callback(cb)
+        self.after(0, lambda: self._finish_training(
+            state[1], int(state[2]), int(state[3]), name))
 
     def _update_train_ui(self,pct,acc,success,fail):
         self.train_bar.set(pct); self.train_ring.set_value(acc)
@@ -1281,6 +1248,9 @@ class SmartAttendanceApp(ctk.CTk):
                 self.all_users={code:name for code,name in c.fetchall()}
                 conn.close()
                 for _,code,*_ in get_today_attendance(): self.marked_today.add(code)
+                # Invalidate mean-embedding cache so it rebuilds with new data
+                if self.engine:
+                    self.engine._mean_db = None
             except: pass
         threading.Thread(target=_load,daemon=True).start()
 
@@ -1294,8 +1264,7 @@ class SmartAttendanceApp(ctk.CTk):
             embeddings_db=self.embeddings_db,
             all_users=self.all_users,
         )
-        if not self.engine.start():
-            messagebox.showerror("Camera Error","Cannot open webcam."); self.engine=None; return
+        self.engine.start()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.att_cam_status.configure(text="● Live",fg=C["green"])
@@ -1338,6 +1307,16 @@ class SmartAttendanceApp(ctk.CTk):
                 user_code,conf_pct=res
                 name=self.all_users.get(user_code,user_code)
                 self._update_live_display(conf_pct,name,user_code)
+                
+                # ------ Hardware Trigger ------
+                if self.arduino_serial:
+                    try:
+                        cmd = b'1' if user_code != "Unknown" else b'0'
+                        self.arduino_serial.write(cmd)
+                    except Exception as e:
+                        print("Serial write error:", e)
+                # ------------------------------
+                
                 marked=mark_attendance_db(user_code,conf_pct)
                 if marked:
                     self.marked_today.add(user_code)
@@ -1355,8 +1334,9 @@ class SmartAttendanceApp(ctk.CTk):
     def _refresh_today_log(self):
         rows=get_today_attendance()
         self.log_listbox.delete(0,tk.END)
-        for name,code,t,status,conf in rows:
-            self.log_listbox.insert(0,f"  ✓  {name:<22}  {t}   {conf:.0f}%")
+        for name,code,in_t,out_t,status,conf in rows:
+            time_str = f"{in_t} - {out_t}" if out_t else f"{in_t} (IN)"
+            self.log_listbox.insert(0,f"  ✓  {name:<22}  {time_str}   {conf:.0f}%")
         self.today_count_lbl.configure(text=str(len(rows)))
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1388,9 +1368,10 @@ class SmartAttendanceApp(ctk.CTk):
             dt.get().strip() or None if dt else None,
             du.get().strip() or None if du else None)
         for item in self.tree.get_children(): self.tree.delete(item)
-        for name,code,date,t,status,conf in rows:
+        for name,code,date,in_t,out_t,status,conf in rows:
+            time_str = f"{in_t} - {out_t}" if out_t else f"{in_t} --"
             tag="present" if status=="PRESENT" else "absent"
-            self.tree.insert("","end",values=(name,code,date,t,status,f"{conf}%"),tags=(tag,))
+            self.tree.insert("","end",values=(name,code,date,time_str,status,f"{conf}%"),tags=(tag,))
         self.tree.tag_configure("present",foreground=C["green"])
         self.tree.tag_configure("absent",foreground=C["red"])
         if hasattr(self,"rec_count_lbl"):

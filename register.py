@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from mtcnn import MTCNN
 from deepface import DeepFace
+from recognize import mask_glasses_region   # glasses-masking — same pre-processing as recognition
 from rich.console import Console
 from rich.progress import (
     Progress, BarColumn, TextColumn, TimeRemainingColumn,
@@ -32,7 +33,7 @@ console = Console()
 DB_PATH = "database/attendance.db"
 FACE_DATA_DIR = "face_data"
 MODEL_PATH = "models/embeddings.npy"
-SAMPLES_REQUIRED = 80  # number of face samples to capture
+SAMPLES_REQUIRED = 120  # number of face samples to capture
 
 # ─────────────────────────────────────────────
 # DATABASE SETUP
@@ -199,8 +200,19 @@ def capture_face_samples(name: str, user_code: str, samples_needed: int = SAMPLE
                     x2 = min(frame.shape[1], x + w + pad)
                     y2 = min(frame.shape[0], y + h + pad)
 
-                    face_crop = frame[y1:y2, x1:x2]
+                    face_crop   = frame[y1:y2, x1:x2]
                     face_resized = cv2.resize(face_crop, (224, 224))
+
+                    # ── Mask glasses so training embeds don't memorise frames ──
+                    kp = result.get('keypoints', {})
+                    crop_w = max(1, x2 - x1)
+                    crop_h = max(1, y2 - y1)
+                    if 'left_eye' in kp and 'right_eye' in kp:
+                        le = ((kp['left_eye'][0]  - x1) * 224.0 / crop_w,
+                              (kp['left_eye'][1]  - y1) * 224.0 / crop_h)
+                        re = ((kp['right_eye'][0] - x1) * 224.0 / crop_w,
+                              (kp['right_eye'][1] - y1) * 224.0 / crop_h)
+                        face_resized = mask_glasses_region(face_resized, le, re)
 
                     img_path = os.path.join(save_dir, f"img_{count:04d}.jpg")
                     cv2.imwrite(img_path, face_resized)
@@ -303,9 +315,9 @@ def train_model():
                     result = DeepFace.represent(
                         img_path=img_path,
                         model_name="ArcFace",
-                        detector_backend="mtcnn",
-                        enforce_detection=True,
-                        align=True
+                        detector_backend="skip",
+                        enforce_detection=False,
+                        align=False
                     )
                     if result:
                         user_embeddings.append(np.array(result[0]['embedding']))
@@ -354,6 +366,66 @@ def train_model():
     console.print(Panel(summary, title="[bold bright_green]✅ Training Complete[/]", border_style="bright_green"))
     console.print("\n")
 
+    return True
+
+# ─────────────────────────────────────────────
+# GUI-FRIENDLY TRAINING  (with progress callback)
+# ─────────────────────────────────────────────
+
+def train_model_with_callback(progress_cb=None):
+    """
+    Identical to train_model() but designed for GUI integration.
+
+    progress_cb(pct, acc, success, fail) is called after every image so
+    the caller can update a progress bar without duplicating this loop.
+    align=True is used to stay consistent with recognition.
+    """
+    users = [d for d in os.listdir(FACE_DATA_DIR)
+             if os.path.isdir(os.path.join(FACE_DATA_DIR, d))]
+    if not users:
+        return False
+
+    total_images = sum(
+        len([f for f in os.listdir(os.path.join(FACE_DATA_DIR, u)) if f.endswith('.jpg')])
+        for u in users
+    )
+
+    embeddings_db   = {}
+    overall_success = 0
+    overall_failed  = 0
+    processed       = 0
+
+    for user_code in users:
+        user_dir = os.path.join(FACE_DATA_DIR, user_code)
+        images   = [f for f in os.listdir(user_dir) if f.endswith('.jpg')]
+        user_embeddings = []
+
+        for img_file in images:
+            img_path = os.path.join(user_dir, img_file)
+            try:
+                result = DeepFace.represent(
+                    img_path=img_path,
+                    model_name="ArcFace",
+                    detector_backend="skip",
+                    enforce_detection=False,
+                    align=True          # must match recognition pipeline
+                )
+                if result:
+                    user_embeddings.append(np.array(result[0]['embedding']))
+                    overall_success += 1
+            except Exception:
+                overall_failed += 1
+
+            processed += 1
+            if progress_cb:
+                pct = processed / max(1, total_images)
+                acc = (overall_success / max(1, overall_success + overall_failed)) * 100
+                progress_cb(pct, acc, overall_success, overall_failed)
+
+        if user_embeddings:
+            embeddings_db[user_code] = user_embeddings
+
+    np.save(MODEL_PATH, embeddings_db)
     return True
 
 # ─────────────────────────────────────────────
