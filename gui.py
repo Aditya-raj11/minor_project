@@ -180,8 +180,12 @@ class WebcamEngine:
         self._overlay_lock=threading.Lock()
         self._overlay_boxes=[]; self._overlay_rej=[]
         self._fps_deque=deque(maxlen=30)
-        self._mean_db=None   # built once from embeddings_db, reset on model reload
-        self._conf_smooth={}  # user_code → EMA-smoothed confidence (reduces fluctuation)
+        self._mean_db=None
+        self._conf_smooth={}
+        self._vote_buf={}        # user_code → deque(maxlen=5) — rolling vote window
+        self._vote_confirmed=set()  # user_codes that have reached VOTE_THRESH this session
+        self._VOTE_WINDOW = 7
+        self._VOTE_THRESH = 4
 
     def start(self):
         self.running=True
@@ -242,80 +246,108 @@ class WebcamEngine:
                 return iou
 
             if not hasattr(self, "_face_cache"): self._face_cache = []
-            self._face_cache = [c for c in self._face_cache if now - c['time'] < INFER_COOLDOWN * 2]
-            
+            # keep tracks alive for 2 s (longer than before so IoU matching is stable)
+            self._face_cache = [c for c in self._face_cache if now - c['time'] < 2.0]
+
             new_cache = []
             available_cache = list(self._face_cache)
-            
+
             for result,face_224,x,y,w,h,conf in valid_faces:
-                user_code=None; conf_pct=0.0; best_dist=1.0
+                user_code=None; conf_pct=0.0
                 current_box = (x, y, w, h)
-                
-                best_iou = 0
-                matched_idx = -1
+
+                # ── IoU match — only used for cooldown / display caching ──
+                best_iou=0; matched_idx=-1
                 for idx, c in enumerate(available_cache):
-                    iou = compute_iou(current_box, c['box'])
-                    if iou > best_iou:
-                        best_iou = iou
-                        matched_idx = idx
-                        
+                    xA=max(current_box[0],c['box'][0]); yA=max(current_box[1],c['box'][1])
+                    xB=min(current_box[0]+current_box[2],c['box'][0]+c['box'][2])
+                    yB=min(current_box[1]+current_box[3],c['box'][1]+c['box'][3])
+                    inter=max(0,xB-xA)*max(0,yB-yA)
+                    union=current_box[2]*current_box[3]+c['box'][2]*c['box'][3]-inter
+                    iou=inter/union if union>0 else 0
+                    if iou>best_iou: best_iou=iou; matched_idx=idx
+
                 needs_inference = True
-                
-                if best_iou > 0.4 and matched_idx != -1:
+                if best_iou > 0.35 and matched_idx != -1:
                     cached_data = available_cache.pop(matched_idx)
                     if now - cached_data['last_infer'] < INFER_COOLDOWN:
                         user_code = cached_data['code']
-                        conf_pct = cached_data['conf']
+                        conf_pct  = cached_data['conf']
                         needs_inference = False
-                        new_cache.append({
-                            'box': current_box, 'code': user_code, 'conf': conf_pct,
-                            'time': now, 'last_infer': cached_data['last_infer']
-                        })
-                
+                        new_cache.append({'box':current_box,'code':user_code,
+                                          'conf':conf_pct,'time':now,
+                                          'last_infer':cached_data['last_infer']})
+
                 if needs_inference:
                     try:
-                        # ── Glasses mask (from recognize.py) ───────────────────────
+                        # ── Glasses mask ────────────────────────────────────────
                         face_for_emb = face_224.copy()
                         kp = result.get('keypoints', {})
                         if 'left_eye' in kp and 'right_eye' in kp:
                             rx2,ry2,rw2,rh2 = result['box']
                             rx2,ry2 = max(0,rx2), max(0,ry2)
-                            pad2 = int(0.12*max(rw2,rh2))
-                            x1c  = max(0,rx2-pad2); y1c = max(0,ry2-pad2)
-                            x2c  = min(frame.shape[1],rx2+rw2+pad2)
-                            y2c  = min(frame.shape[0],ry2+rh2+pad2)
-                            cw2  = max(1,x2c-x1c); ch2 = max(1,y2c-y1c)
-                            le2  = ((kp['left_eye'][0] -x1c)*224.0/cw2,
-                                    (kp['left_eye'][1] -y1c)*224.0/ch2)
-                            re2  = ((kp['right_eye'][0]-x1c)*224.0/cw2,
-                                    (kp['right_eye'][1]-y1c)*224.0/ch2)
+                            pad2 = int(0.20*max(rw2,rh2))
+                            x1c=max(0,rx2-pad2); y1c=max(0,ry2-pad2)
+                            x2c=min(frame.shape[1],rx2+rw2+pad2)
+                            y2c=min(frame.shape[0],ry2+rh2+pad2)
+                            cw2=max(1,x2c-x1c); ch2=max(1,y2c-y1c)
+                            le2=((kp['left_eye'][0]-x1c)*224.0/cw2,
+                                 (kp['left_eye'][1]-y1c)*224.0/ch2)
+                            re2=((kp['right_eye'][0]-x1c)*224.0/cw2,
+                                 (kp['right_eye'][1]-y1c)*224.0/ch2)
                             face_for_emb = mask_glasses_region(face_for_emb, le2, re2)
 
-                        # ── Identify (from recognize.py) ─────────────────────
+                        # ── Identify ────────────────────────────────────────
                         if self._mean_db is None:
                             self._mean_db = build_mean_embeddings(self.embeddings_db)
-                        user_code, _dist, conf_pct = identify_face(
+                        inferred_code, _dist, inferred_conf = identify_face(
                             face_for_emb, self.embeddings_db, self._mean_db
                         )
                     except Exception as e:
                         print(f"[DEBUG ERR] Recognition error: {e}")
-                    
-                    if user_code:
-                        # ── EMA smoothing: 70% old + 30% new ──
-                        EMA = 0.30
-                        prev = self._conf_smooth.get(user_code, conf_pct)
-                        conf_pct = (1 - EMA) * prev + EMA * conf_pct
-                        self._conf_smooth[user_code] = conf_pct
-                        new_cache.append({
-                            'box': current_box, 'code': user_code, 'conf': conf_pct,
-                            'time': now, 'last_infer': now
-                        })
-                        try: self.result_q.put_nowait((user_code, conf_pct))
-                        except queue.Full: pass
+                        inferred_code, inferred_conf = None, 0.0
 
-                name=self.all_users.get(user_code,None) if user_code else None
-                boxes.append((x,y,w,h,name,conf_pct,user_code))
-                
+                    # ── Per-user vote accumulation (NOT per face-track) ───────
+                    # Votes stored globally per user_code so bounding-box shifts
+                    # never reset the count.
+                    if inferred_code:
+                        buf = self._vote_buf.setdefault(
+                            inferred_code, deque(maxlen=self._VOTE_WINDOW))
+                        buf.append(1)
+                        vote_count = sum(buf)
+                        if vote_count >= self._VOTE_THRESH:
+                            if inferred_code not in self._vote_confirmed:
+                                # First confirmation — fire attendance
+                                self._vote_confirmed.add(inferred_code)
+                            user_code = inferred_code
+                        else:
+                            # Tentative — show face but don't mark attendance yet
+                            user_code = inferred_code
+                    else:
+                        user_code = None
+
+                    # EMA smooth confidence for display
+                    if user_code:
+                        EMA  = 0.30
+                        prev = self._conf_smooth.get(user_code, inferred_conf)
+                        conf_pct = (1-EMA)*prev + EMA*inferred_conf
+                        self._conf_smooth[user_code] = conf_pct
+                        # Always push to result_q when confirmed → keeps ring score live
+                        if user_code in self._vote_confirmed:
+                            try: self.result_q.put_nowait((user_code, conf_pct))
+                            except queue.Full: pass
+                    else:
+                        conf_pct = 0.0
+
+
+                    new_cache.append({'box':current_box,'code':user_code,
+                                      'conf':conf_pct,'time':now,'last_infer':now})
+
+                # confirmed = user has reached vote threshold this session
+                confirmed_flag = (user_code in self._vote_confirmed) if user_code else False
+                name = self.all_users.get(user_code, None) if user_code else None
+                boxes.append((x,y,w,h,name,conf_pct,user_code,confirmed_flag))
+
             self._face_cache = new_cache
             with self._overlay_lock:
                 self._overlay_boxes=boxes; self._overlay_rej=rejected
@@ -338,12 +370,18 @@ class WebcamEngine:
                 rej=list(self._overlay_rej)
 
             # Draw face boxes — clean rounded style
-            for (x,y,w,h,name,cp,uc) in boxes:
-                if name:
-                    col=(0,180,60); label=name
-                    sub=f"{cp:.0f}% match"
+            for box_data in boxes:
+                if len(box_data) == 8:
+                    x,y,w,h,name,cp,uc,confirmed = box_data
+                else:
+                    x,y,w,h,name,cp,uc = box_data; confirmed = True
+                if name and confirmed:
+                    col=(0,180,60); label=name; sub=f"{cp:.0f}% match"
+                elif name and not confirmed:
+                    col=(0,160,220); label=name; sub="confirming…"
                 else:
                     col=(180,60,60); label="Unknown"; sub=""
+
                 # Rounded corners only
                 cl=18
                 for px,py,dx,dy in [(x,y,1,1),(x+w,y,-1,1),(x,y+h,1,-1),(x+w,y+h,-1,-1)]:
@@ -372,8 +410,10 @@ class WebcamEngine:
     def update_overlay_mark(self,marked_codes):
         with self._overlay_lock:
             updated=[]
-            for (x,y,w,h,name,cp,uc) in self._overlay_boxes:
-                updated.append((x,y,w,h,name,cp,uc))
+            for box_data in self._overlay_boxes:
+                x,y,w,h,name,cp,uc = box_data[:7]
+                confirmed = box_data[7] if len(box_data) > 7 else True
+                updated.append((x,y,w,h,name,cp,uc,confirmed))
             self._overlay_boxes=updated
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1141,7 +1181,7 @@ class SmartAttendanceApp(ctk.CTk):
                             r2 = result
                             x2,y2,w2,h2 = r2['box']
                             x2,y2 = max(0,x2), max(0,y2)
-                            pad2  = int(0.12*max(w2,h2))
+                            pad2  = int(0.20*max(w2,h2))
                             x1_c  = max(0, x2-pad2); y1_c = max(0, y2-pad2)
                             x2_c  = min(frame.shape[1], x2+w2+pad2)
                             y2_c  = min(frame.shape[0], y2+h2+pad2)
